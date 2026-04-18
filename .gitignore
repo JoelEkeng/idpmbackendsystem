@@ -1,0 +1,13 @@
+# Environment files
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Alembic directories/files
+alembic/
+**/alembic/
+
+# Python cache
+__pycache__/
+**/__pycache__/

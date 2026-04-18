@@ -1,0 +1,9 @@
+fastapi[standard]
+SQLAlchemy
+Alembic
+Pydantic
+uvicorn
+psycopg
+python-dotenv
+asyncpg
+greenlet
