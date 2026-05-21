@@ -3,13 +3,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.database import get_db
 from app.models.equipment import Equipment
+from app.models.user import User
+from app.models.enums import RoleEnum
 from app.schemas.equipment import EquipmentCreate, EquipmentUpdate, EquipmentRead
+from app.utils.auth import get_current_user
+from app.utils.permissions import is_admin
 
 router = APIRouter(prefix="/equipment", tags=["Equipments"])
 
 
 @router.get("", response_model=list[EquipmentRead])
-async def get_equipments(db: AsyncSession = Depends(get_db)):
+async def get_equipments(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+
     stmt = select(Equipment)
     result = await db.execute(stmt)
     equipments = result.scalars().all()
@@ -20,7 +30,11 @@ async def get_equipments(db: AsyncSession = Depends(get_db)):
 async def create_equipment(
     payload: EquipmentCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+
     # Check uniqueness of ID
     existing = await db.get(Equipment, payload.id)
     if existing:
@@ -47,7 +61,11 @@ async def update_equipment(
     equipment_id: str,
     payload: EquipmentUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+
     equipment = await db.get(Equipment, equipment_id)
     if not equipment:
         raise HTTPException(404, "Equipment not found")
@@ -66,7 +84,11 @@ async def update_equipment(
 async def delete_equipment(
     equipment_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+
     equipment = await db.get(Equipment, equipment_id)
     if not equipment:
         raise HTTPException(404, "Equipment not found")

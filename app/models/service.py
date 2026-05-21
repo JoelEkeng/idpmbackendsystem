@@ -1,5 +1,5 @@
 from sqlalchemy.orm import relationship, Mapped, mapped_column
-from sqlalchemy import Date, Time, Integer
+from sqlalchemy import Date, Time, Integer, String
 from app.models.base import Base, UUIDMixin, TimestampMixin
 from typing import List
 from datetime import date, time
@@ -7,6 +7,8 @@ from datetime import date, time
 
 class Service(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "services"
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
 
     date: Mapped[date] = mapped_column(Date, nullable=False)
 

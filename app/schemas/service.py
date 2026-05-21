@@ -4,6 +4,7 @@ from datetime import date, datetime, time
 
 
 class ServiceBase(BaseModel):
+    name: str
     date: date
     start_time: time
     end_time: time

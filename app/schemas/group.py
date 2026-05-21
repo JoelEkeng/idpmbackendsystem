@@ -2,6 +2,7 @@ from pydantic import BaseModel, ConfigDict
 from uuid import UUID
 from datetime import datetime
 from app.models.enums import GroupMembershipStatus
+from typing import Optional
 
 class LeaderInfo(BaseModel):
     id: str
@@ -28,13 +29,13 @@ class GroupMemberRead(BaseModel):
 
 class GroupCreate(BaseModel):
     name: str
-    leader_id: str | None = None
+    leader_id: Optional[str] = None
 
 class GroupRead(BaseModel):
     id: UUID
     name: str
     created_at: datetime
     leader: LeaderInfo | None
-    member_count: int
+    member_count: int | None
 
     model_config = {"from_attributes": True}

@@ -10,6 +10,9 @@ from app.models.user import User
 from app.models.group import GroupMember, Group
 from app.schemas.useroverview import UserOverview, GroupWithMembershipRead
 from app.schemas.user import UserAdminOverview, UserMinimal
+from app.models.enums import RoleEnum
+from app.utils.auth import get_current_user
+from app.utils.permissions import is_admin
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -127,7 +130,13 @@ async def get_minimal_user(user_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/admin-overview", response_model=list[UserAdminOverview])
-async def get_users_for_admin(db: AsyncSession = Depends(get_db)):
+async def get_users_for_admin(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+
     stmt = (
         select(User)
         .options(
@@ -150,7 +159,7 @@ async def get_users_for_admin(db: AsyncSession = Depends(get_db)):
                 department=user.profile.department if user.profile else None,
                 group_name=membership.group.name if membership else None,
                 membership_status=membership.status if membership else None,
-                role=user.profile.role if user.profile else None
+                roles=list(user.profile.roles) if user.profile else []
             )
         )
     return response

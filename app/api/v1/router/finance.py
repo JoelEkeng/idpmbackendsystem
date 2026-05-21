@@ -28,8 +28,10 @@ from app.schemas.finance import (
 )
 
 from app.utils.auth import get_current_user
+from app.utils.permissions import is_admin, has_any_role
 from app.models.user import User
 from app.models.profile import Profile
+from app.models.enums import RoleEnum
 
 from dotenv import load_dotenv
 
@@ -240,8 +242,17 @@ async def get_ledger(
     status: PaymentStatus | None = Query(None),
     payment_type: PaymentType | None = Query(None),
     user_id: str | None = Query(None),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    # Finance team, admins, and super admins can read the full ledger.
+    # Regular users can only read their own rows.
+    privileged = has_any_role(
+        current_user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN
+    )
+    if not privileged:
+        # Force scoping to the caller.
+        user_id = current_user.id
     # Start from FinanceTransaction and join Profile → User
     query = (
         select(FinanceTransaction, Profile.fullname)
@@ -301,7 +312,11 @@ async def finance_summary(
 @router.get("/admin/summary")
 async def admin_finance_summary(
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if not has_any_role(current_user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN):
+        raise HTTPException(403, "Finance access required")
+
     # Aggregate totals from ProfileFinanceStats
     result = await db.execute(
         select(

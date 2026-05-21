@@ -1,16 +1,15 @@
-from pydantic import BaseModel, ConfigDict, EmailStr
-from typing import Optional
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from typing import List, Optional
 from uuid import UUID
 from datetime import datetime
 from app.models.enums import RoleEnum, GroupMembershipStatus
-from typing import List, Optional
 
 class ProfileRead(BaseModel):
     id: UUID
     first_name: Optional[str]
     last_name: Optional[str]
     phone_number: Optional[str]
-    role: RoleEnum
+    roles: List[RoleEnum] = Field(default_factory=list)
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -30,7 +29,7 @@ class UserAdminOverview(BaseModel):
     department: Optional[str]
     group_name: Optional[str]
     membership_status: Optional[GroupMembershipStatus]
-    role: Optional[RoleEnum]
+    roles: List[RoleEnum] = Field(default_factory=list)
 
     class Config:
         model_config = ConfigDict(from_attributes=True)
@@ -38,6 +37,7 @@ class UserAdminOverview(BaseModel):
 class UserMinimal(BaseModel):
     id: str
     fullname: str
+    email: Optional[EmailStr] = None
 
     class Config:
         model_config = ConfigDict(from_attributes=True)

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict, Field
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 from datetime import date, datetime
 from app.models.enums import RoleEnum, MaritalStatus, Group, GroupMembershipStatus
@@ -18,6 +18,7 @@ class ProfileBase(BaseModel):
     emergency_contact: Optional[str] = Field(None, max_length=20)
     emergency_name: Optional[str] = Field(None, max_length=50)
     department: Optional[str] = Field(None, max_length=50)
+    fingerprint_id: Optional[str] = Field(None, max_length=50)
 
 
 # -----------------------------
@@ -43,7 +44,13 @@ class ProfileUpdate(ProfileBase):
 # -----------------------------
 
 class ProfileRoleUpdate(BaseModel):
-    role: RoleEnum
+    """Sent by SUPER_ADMIN to set a profile's roles. Backend will
+    always ensure RoleEnum.USER is present in the resulting list."""
+    roles: List[RoleEnum] = Field(default_factory=list)
+
+
+class ProfileFingerprintUpdate(BaseModel):
+    fingerprint_id: Optional[str] = Field(None, max_length=50)
 
 
 # -----------------------------
@@ -53,7 +60,7 @@ class ProfileRoleUpdate(BaseModel):
 class ProfileRead(ProfileBase):
     id: UUID
     user_id: str
-    role: RoleEnum
+    roles: List[RoleEnum]
     profile_completed: bool
     created_at: datetime
     updated_at: datetime

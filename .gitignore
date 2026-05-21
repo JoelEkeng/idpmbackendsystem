@@ -13,3 +13,7 @@ __pycache__/
 **/__pycache__/
 
 alembic.ini
+
+#env file
+idpm/
+tests

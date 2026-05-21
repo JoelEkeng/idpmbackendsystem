@@ -13,23 +13,20 @@ from app.schemas.group import (
     GroupRead,
 )
 from sqlalchemy.orm import selectinload
+from app.utils.auth import get_current_user
+from app.utils.permissions import is_admin
+from app.models.enums import RoleEnum
 
 router = APIRouter(prefix="/groups", tags=["Group"])
-
-# @router.get("/", response_model=list[GroupRead])
-# async def get_groups(
-#     db: AsyncSession = Depends(get_db),
-# ):
-#     result = await db.execute(select(Group))
-#     groups = result.scalars().all()
-#     return [GroupRead.model_validate(group) for group in groups]    
-    
-#     return groups
 
 @router.get("", response_model=list[GroupRead])
 async def get_groups(
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if not (current_user.profile):
+        raise HTTPException(403, "Only users are allowed")
+        
     stmt = (
         select(Group)
         .options(
@@ -58,16 +55,21 @@ async def get_groups(
 async def create_group(
     payload: GroupCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+        
     # If leader_id provided, ensure user exists
     if payload.leader_id:
         leader = await db.get(User, payload.leader_id)
         if not leader:
             raise HTTPException(404, "Leader not found")
-
+    
     group = Group(
         name=payload.name,
-        leader_id=payload.leader_id,
+        # leader_id=payload.leader_id,
     )
 
     db.add(group)
@@ -85,33 +87,16 @@ async def create_group(
 
     return response_data
 
-@router.patch("/{group_id}/assign-leader", response_model=GroupRead)
-async def assign_group_leader(
-    group_id: UUID,
-    leader_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    group = await db.get(Group, group_id)
-    if not group:
-        raise HTTPException(404, "Group not found")
-
-    leader = await db.get(User, leader_id)
-    if not leader:
-        raise HTTPException(404, "User not found")
-
-    group.leader_id = leader_id
-
-    await db.commit()
-    await db.refresh(group)
-
-    return group
-
 @router.patch("/{group_id}", response_model=GroupRead)
 async def update_group(
     group_id: UUID,
     payload: GroupCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+        
     group = await db.get(Group, group_id)
     if not group:
         raise HTTPException(404, "Group not found")
@@ -120,6 +105,12 @@ async def update_group(
         leader = await db.get(User, payload.leader_id)
         if not leader:
             raise HTTPException(404, "Leader not found")
+    
+        if current_user.id not in [member.user_id for member in group.members]:
+            raise HTTPException(400, "User is not a member of this group")
+        
+        if payload.leader_id == current_user.id:
+            raise HTTPException(400, "You cannot assign yourself as leader")
 
     group.name = payload.name
 
@@ -135,7 +126,11 @@ async def update_group(
 async def delete_group(
     group_id: UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+        
     group = await db.get(Group, group_id)
     if not group:
         raise HTTPException(404, "Group not found")
@@ -148,29 +143,32 @@ async def delete_group(
 
 @router.post("/request", response_model=GroupMemberRead)
 async def request_group_membership(
-    user_id: str,
     payload: GroupRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     group = await db.get(Group, payload.group_id)
     if not group:
         raise HTTPException(404, "Group not found")
 
-    user = await db.get(User, user_id)
-    if not user:
-        raise HTTPException(404, "User not found")
-
-    # Only one group allowed per user (your constraint enforces this)
+    # Only one group allowed per user. Re-requesting after rejection
+    # should replace the prior record to keep the unique constraint happy.
     result = await db.execute(
-        select(GroupMember).where(GroupMember.user_id == user_id)
+        select(GroupMember).where(GroupMember.user_id == current_user.id)
     )
     existing = result.scalar_one_or_none()
 
     if existing:
-        raise HTTPException(400, "User already has a group membership")
+        if existing.status == GroupMembershipStatus.APPROVED:
+            raise HTTPException(400, "User already belongs to a group")
+        if existing.status == GroupMembershipStatus.PENDING:
+            raise HTTPException(400, "A pending request already exists")
+        # REJECTED → allow re-request by replacing
+        await db.delete(existing)
+        await db.flush()
 
     membership = GroupMember(
-        user_id=user_id,
+        user_id=current_user.id,
         group_id=payload.group_id,
         status=GroupMembershipStatus.PENDING,
     )
@@ -181,22 +179,70 @@ async def request_group_membership(
 
     return membership
 
+
+@router.get("/leader/pending", response_model=list[GroupMemberRead])
+async def list_pending_requests_for_leader(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return PENDING memberships for groups led by the current user."""
+    stmt = (
+        select(GroupMember)
+        .join(Group, GroupMember.group_id == Group.id)
+        .where(
+            Group.leader_id == current_user.id,
+            GroupMember.status == GroupMembershipStatus.PENDING,
+        )
+    )
+    result = await db.execute(stmt)
+    return result.scalars().unique().all()
+
+
 @router.post("/{membership_id}/approve", response_model=GroupMemberRead)
 async def approve_group_member(
     membership_id: UUID,
-    approver_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     membership = await db.get(GroupMember, membership_id)
     if not membership:
         raise HTTPException(404, "Membership not found")
 
-    approver = await db.get(User, approver_id)
-    if not approver:
-        raise HTTPException(404, "Approver not found")
+    group = await db.get(Group, membership.group_id)
+    if not group:
+        raise HTTPException(404, "Group not found")
+
+    if group.leader_id != current_user.id:
+        raise HTTPException(403, "Only the group leader can approve members")
 
     membership.status = GroupMembershipStatus.APPROVED
-    membership.approved_by = approver_id
+    membership.approved_by = current_user.id
+
+    await db.commit()
+    await db.refresh(membership)
+
+    return membership
+
+
+@router.post("/{membership_id}/reject", response_model=GroupMemberRead)
+async def reject_group_member(
+    membership_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    membership = await db.get(GroupMember, membership_id)
+    if not membership:
+        raise HTTPException(404, "Membership not found")
+
+    group = await db.get(Group, membership.group_id)
+    if not group:
+        raise HTTPException(404, "Group not found")
+
+    if group.leader_id != current_user.id:
+        raise HTTPException(403, "Only the group leader can reject members")
+
+    membership.status = GroupMembershipStatus.REJECTED
+    membership.approved_by = current_user.id
 
     await db.commit()
     await db.refresh(membership)
@@ -207,10 +253,14 @@ async def approve_group_member(
 async def get_group_members(
     group_id: UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     group = await db.get(Group, group_id)
     if not group:
         raise HTTPException(404, "Group not found")
+
+    if group.leader_id != current_user.id and not is_admin(current_user):
+        raise HTTPException(403, "Only the group leader or an admin can view members")
 
     result = await db.execute(
         select(GroupMember).where(GroupMember.group_id == group_id)

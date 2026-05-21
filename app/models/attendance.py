@@ -24,6 +24,6 @@ class Attendance(Base, UUIDMixin, TimestampMixin):
     service = relationship("Service", back_populates="attendances")
     profile = relationship("Profile", back_populates="attendances")
 
-    _table_args__ = (
-        UniqueConstraint("profile_id", "service_id"),
+    __table_args__ = (
+        UniqueConstraint("profile_id", "service_id", name="uq_attendance_profile_service"),
     )

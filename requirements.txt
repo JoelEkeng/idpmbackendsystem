@@ -7,3 +7,5 @@ psycopg
 python-dotenv
 asyncpg
 greenlet
+pytest
+pytest-asyncio

@@ -1,5 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 from app.core.config import get_settings
 from app.api.v1.router import (
     profile,
@@ -8,14 +11,20 @@ from app.api.v1.router import (
     equipment,
     service, attendance, finance
 )
-import os
 import dotenv
-
 dotenv.load_dotenv()
 
 
 settings = get_settings()
 
+
+sentry_sdk.init(
+    dsn=settings.SENTRY_DSN,
+    # Add data like request headers and IP for users,
+    # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
+    send_default_pii=True,
+    enable_logs=True,
+)
 
 app = FastAPI(title=settings.APP_NAME)
 
@@ -39,4 +48,8 @@ app.include_router(finance.router, prefix=settings.API_PREFIX)
 async def health():
     return {"status": "ok"
     }
+
+@app.get("/sentry-debug")
+async def trigger_error():
+    division_by_zero = 5 / 0
 

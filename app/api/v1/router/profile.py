@@ -11,9 +11,41 @@ from app.schemas.profile import (
     ProfileUpdate,
     ProfileRead,
     ProfileRoleUpdate,
+    ProfileFingerprintUpdate,
 )
+from app.utils.auth import get_current_user
+from app.utils.permissions import is_admin, is_super_admin
+from app.models.enums import RoleEnum
 
 router = APIRouter(prefix="/profiles", tags=["Profiles"])
+
+
+# ---------------------------------------------------------
+# 0️⃣ SYNC PROFILE (First sign-in bootstrap)
+# Idempotent: ensures a Profile row exists for the authed
+# BetterAuth user. Safe to call on every sign-in.
+# ---------------------------------------------------------
+
+@router.post("/sync", response_model=ProfileRead)
+async def sync_profile(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    stmt = select(Profile).where(Profile.user_id == current_user.id)
+    result = await db.execute(stmt)
+    existing = result.scalar_one_or_none()
+
+    if existing:
+        return existing
+
+    profile = Profile(
+        user_id=current_user.id,
+        fullname=current_user.name,
+    )
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+    return profile
 
 
 @router.post("", response_model=ProfileRead)
@@ -43,6 +75,42 @@ async def create_profile(
     )
 
     db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+
+    return profile
+
+
+@router.patch("/{user_id}/fingerprint", response_model=ProfileRead)
+async def update_fingerprint_id(
+    user_id: str,
+    payload: ProfileFingerprintUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+
+    stmt = select(Profile).where(Profile.user_id == user_id)
+    result = await db.execute(stmt)
+    profile = result.scalar_one_or_none()
+
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    fingerprint_id = payload.fingerprint_id.strip() if payload.fingerprint_id else None
+    if fingerprint_id:
+        existing_stmt = select(Profile).where(
+            Profile.fingerprint_id == fingerprint_id,
+            Profile.user_id != user_id,
+        )
+        existing_result = await db.execute(existing_stmt)
+        existing_profile = existing_result.scalar_one_or_none()
+        if existing_profile:
+            raise HTTPException(status_code=400, detail="Fingerprint ID already in use")
+
+    profile.fingerprint_id = fingerprint_id
+
     await db.commit()
     await db.refresh(profile)
 
@@ -116,7 +184,12 @@ async def update_role(
     user_id: str,
     payload: ProfileRoleUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    # Only SUPER_ADMIN can mutate roles — ADMIN should not be able to escalate.
+    if not is_super_admin(current_user):
+        raise HTTPException(403, "Super admin only")
+
     stmt = select(Profile).where(Profile.user_id == user_id)
     result = await db.execute(stmt)
     profile = result.scalar_one_or_none()
@@ -124,7 +197,24 @@ async def update_role(
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
 
-    profile.role = payload.role
+    # Apply roles from payload (always include USER as the base).
+    incoming = list(payload.roles or [])
+    if RoleEnum.USER not in incoming:
+        incoming.insert(0, RoleEnum.USER)
+    # Only one SUPER_ADMIN allowed in the system.
+    if RoleEnum.SUPER_ADMIN in incoming:
+        existing_q = await db.execute(
+            select(Profile).where(
+                Profile.roles.any(RoleEnum.SUPER_ADMIN),
+                Profile.user_id != user_id,
+            )
+        )
+        if existing_q.scalar_one_or_none() is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="There can only be one SUPER_ADMIN in the system.",
+            )
+    profile.roles = incoming
 
     await db.commit()
     await db.refresh(profile)
@@ -140,7 +230,11 @@ async def update_role(
 async def delete_profile(
     user_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    if not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+
     stmt = select(Profile).where(Profile.user_id == user_id)
     result = await db.execute(stmt)
     profile = result.scalar_one_or_none()
