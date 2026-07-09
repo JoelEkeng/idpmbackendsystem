@@ -1,8 +1,10 @@
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
-from pydantic import AnyUrl
+from pydantic_settings import NoDecode
+from pydantic import AnyUrl, field_validator
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -24,11 +26,28 @@ class Settings(BaseSettings):
     BETTERAUTH_PUBLIC_KEY: str
     JWT_ALGORITHM: str = "RS256"
 
+    # Allowed browser origins for CORS. Accepts a comma-separated string or a
+    # JSON list in the environment, e.g. "https://app.example.com,https://admin.example.com".
+    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
     SENTRY_DSN: str | None = None
     SENTRY_ENVIRONMENT: str = "development"
     SENTRY_TRACES_SAMPLE_RATE: float = 0.0
 
     RATE_LIMIT: str = "100/minute"
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def _split_cors_origins(cls, v):
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            # Allow a JSON-style list too; otherwise treat as comma-separated.
+            if s.startswith("["):
+                return v
+            return [origin.strip() for origin in s.split(",") if origin.strip()]
+        return v
 
 
 @lru_cache

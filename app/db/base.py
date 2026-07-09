@@ -1,4 +1,3 @@
-# app/db/base.py
 import uuid
 from datetime import datetime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column

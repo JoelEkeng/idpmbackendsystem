@@ -2,9 +2,12 @@ import enum
 
 
 class RoleEnum(str, enum.Enum):
-    """User roles. Every user has at least USER. Extra roles are appended,
-    e.g. a group leader has [USER, GROUP_LEADER]. Only one SUPER_ADMIN exists."""
+    """User roles. Every user has the base USER role. Extra roles are appended,
+    e.g. a regular member is [USER, MEMBER] and a group leader is
+    [USER, GROUP_LEADER]. USER and ADMIN are distinct. Only one SUPER_ADMIN
+    exists."""
     USER = "USER"
+    MEMBER = "MEMBER"
     GROUP_LEADER = "GROUP_LEADER"
     FINANCE = "FINANCE"
     ADMIN = "ADMIN"

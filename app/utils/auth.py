@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi import Depends, Header, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -19,7 +21,7 @@ async def get_current_user(
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid auth header")
 
-    session_token = authorization.replace("Bearer ", "")
+    session_token = authorization.replace("Bearer ", "", 1)
 
     result = await db.execute(
         select(AuthSession).where(AuthSession.token == session_token)
@@ -28,6 +30,15 @@ async def get_current_user(
 
     if not session:
         raise HTTPException(status_code=401, detail="Invalid session")
+
+    # Reject expired sessions. `expiresAt` may be stored tz-naive (UTC) or
+    # tz-aware depending on the driver; normalize before comparing.
+    expires_at = session.expiresAt
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=401, detail="Session expired")
 
     result = await db.execute(
         select(User)
