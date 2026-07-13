@@ -1,3 +1,5 @@
+import json
+
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 from pydantic_settings import NoDecode
@@ -28,7 +30,10 @@ class Settings(BaseSettings):
 
     # Allowed browser origins for CORS. Accepts a comma-separated string or a
     # JSON list in the environment, e.g. "https://app.example.com,https://admin.example.com".
-    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    CORS_ORIGINS: Annotated[list[str], NoDecode] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
 
     SENTRY_DSN: str | None = None
     SENTRY_ENVIRONMENT: str = "development"
@@ -45,8 +50,15 @@ class Settings(BaseSettings):
                 return []
             # Allow a JSON-style list too; otherwise treat as comma-separated.
             if s.startswith("["):
-                return v
-            return [origin.strip() for origin in s.split(",") if origin.strip()]
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(origin).strip() for origin in parsed if str(origin).strip()]
+                # Fall back to comma-splitting after stripping brackets/quotes.
+                s = s.strip("[]")
+            return [origin.strip().strip('"').strip("'") for origin in s.split(",") if origin.strip().strip('"').strip("'")]
         return v
 
 

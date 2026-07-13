@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from uuid import UUID
 from app.core.database import get_db
 from app.models.user import User
@@ -26,30 +26,34 @@ async def get_groups(
 ):
     if not (current_user.profile):
         raise HTTPException(403, "Only users are allowed")
-        
+
+    # Count members per group with a single aggregate instead of loading every
+    # GroupMember row into memory just to call len().
+    member_counts = (
+        select(GroupMember.group_id, func.count(GroupMember.id).label("member_count"))
+        .group_by(GroupMember.group_id)
+        .subquery()
+    )
+
     stmt = (
-        select(Group)
-        .options(
-            selectinload(Group.leader),
-            selectinload(Group.members)  # assuming relationship exists
-        )
+        select(Group, func.coalesce(member_counts.c.member_count, 0))
+        .outerjoin(member_counts, Group.id == member_counts.c.group_id)
+        .options(selectinload(Group.leader))
     )
 
     result = await db.execute(stmt)
-    groups = result.scalars().unique().all()
+    rows = result.all()
 
-    response = []
-
-    for group in groups:
-        response.append({
+    return [
+        {
             "id": group.id,
             "name": group.name,
             "created_at": group.created_at,
             "leader": group.leader,
-            "member_count": len(group.members),
-        })
-
-    return response
+            "member_count": count,
+        }
+        for group, count in rows
+    ]
 
 @router.post("", response_model=GroupRead)
 async def create_group(

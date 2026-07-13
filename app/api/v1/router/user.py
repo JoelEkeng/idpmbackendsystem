@@ -2,7 +2,7 @@ from sqlalchemy.orm import selectinload
 from app.schemas.profile import ProfileRead
 from app.schemas.group import GroupRead
 from pydantic import BaseModel
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.database import get_db
@@ -20,7 +20,11 @@ router = APIRouter(prefix="/users", tags=["Users"])
 async def get_user_overview(
     user_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    # A user may view their own overview; admins may view anyone's.
+    if user_id != current_user.id and not is_admin(current_user):
+        raise HTTPException(403, "Not allowed to view this user")
     stmt = (
         select(User)
         .where(User.id == user_id)
@@ -103,7 +107,10 @@ async def get_user_overview(
 
 
 @router.get("/minimal", response_model=list[UserMinimal])
-async def get_minimal_users(db: AsyncSession = Depends(get_db)):
+async def get_minimal_users(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     # Select only the columns we need
     stmt = select(User.id, User.name, User.email)
     result = await db.execute(stmt)
@@ -113,7 +120,11 @@ async def get_minimal_users(db: AsyncSession = Depends(get_db)):
     return [UserMinimal(id=u.id, fullname=u.name, email=u.email) for u in users]
 
 @router.get("/{user_id}/minimal", response_model=UserMinimal)
-async def get_minimal_user(user_id: str, db: AsyncSession = Depends(get_db)):
+async def get_minimal_user(
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     # Select only the columns we need
     stmt = select(User.id, User.name).where(User.id == user_id)
     result = await db.execute(stmt)
@@ -133,6 +144,8 @@ async def get_minimal_user(user_id: str, db: AsyncSession = Depends(get_db)):
 async def get_users_for_admin(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
     if not is_admin(current_user):
         raise HTTPException(403, "Admins only")
@@ -144,6 +157,9 @@ async def get_users_for_admin(
             selectinload(User.memberships)
             .selectinload(GroupMember.group)
         )
+        .order_by(User.id)
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(stmt)
     users = result.scalars().unique().all()

@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.database import get_db
+from app.core.cache import cache_get_json, cache_set_json, cache_delete
 from app.models.attendance import Attendance
 from app.models.profile import Profile
 from app.models.service import Service
@@ -21,6 +22,10 @@ import json
 
 
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
+
+
+def _service_cache_key(service_id) -> str:
+    return f"attendance:service:{service_id}"
 
 
 @router.post("/checkin")
@@ -110,6 +115,10 @@ async def fingerprint_checkin(
     db.add(attendance)
     await db.commit()
 
+    # Invalidate the cached attendance list for this service so the monitor
+    # page reflects the new check-in on its next refresh.
+    await cache_delete(_service_cache_key(service.id))
+
     return {
         "status": "success",
         "user": profile.fullname,
@@ -141,8 +150,10 @@ _ATTENDANCE_EAGER = (
 async def list_all_attendance(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
-    """Admin-only: every attendance record."""
+    """Admin-only: attendance records, newest first, paginated."""
     if not is_admin(current_user):
         raise HTTPException(403, "Admins only")
 
@@ -150,6 +161,8 @@ async def list_all_attendance(
         select(Attendance)
         .options(*_ATTENDANCE_EAGER)
         .order_by(Attendance.check_in_time.desc())
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(stmt)
     return [_to_read(a) for a in result.scalars().all()]
@@ -314,9 +327,17 @@ async def get_service_attendance(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Attendance for every member who attended a specific service."""
+    """Attendance for every member who attended a specific service.
+
+    Cached in Redis for 30s and invalidated on new check-ins for the service.
+    """
     if not is_admin(current_user):
         raise HTTPException(403, "Admins only")
+
+    cache_key = _service_cache_key(service_id)
+    cached = await cache_get_json(cache_key)
+    if cached is not None:
+        return cached
 
     stmt = (
         select(Attendance)
@@ -325,4 +346,8 @@ async def get_service_attendance(
         .order_by(Attendance.check_in_time.desc())
     )
     result = await db.execute(stmt)
-    return [_to_read(a) for a in result.scalars().all()]
+    records = [_to_read(a) for a in result.scalars().all()]
+
+    payload = [r.model_dump(mode="json") for r in records]
+    await cache_set_json(cache_key, payload, ttl=30)
+    return payload

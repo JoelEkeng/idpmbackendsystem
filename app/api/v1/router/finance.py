@@ -118,6 +118,9 @@ async def paystack_webhook(
     db: AsyncSession = Depends(get_db),
 ):
 
+    if not PAYSTACK_SECRET:
+        raise HTTPException(503, "Payment provider not configured")
+
     body = await request.body()
 
     signature = request.headers.get("x-paystack-signature")
@@ -128,7 +131,7 @@ async def paystack_webhook(
         hashlib.sha512
     ).hexdigest()
 
-    if hash != signature:
+    if not signature or not hmac.compare_digest(hash, signature):
         raise HTTPException(400, "Invalid webhook")
 
     payload = await request.json()
@@ -212,12 +215,15 @@ async def update_finance_stats(profile_id, db):
 @router.post("/manual")
 async def manual_payment(
     payload: ManualPaymentCreate,
-    
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
+    # Recording a manual payment marks money as received, so it must be
+    # restricted to the finance team / admins.
+    if not has_any_role(user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN):
+        raise HTTPException(403, "Finance access required")
 
     reference = str(uuid.uuid4())
-    user: User = Depends(get_current_user),
     transaction = FinanceTransaction(
         profile_id=payload.profile_id,
         payment_type=payload.payment_type,
@@ -242,6 +248,8 @@ async def get_ledger(
     status: PaymentStatus | None = Query(None),
     payment_type: PaymentType | None = Query(None),
     user_id: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -267,18 +275,26 @@ async def get_ledger(
     if payment_type:
         query = query.where(FinanceTransaction.payment_type == payment_type)
 
-    query = query.order_by(FinanceTransaction.created_at.desc())
+    query = query.order_by(FinanceTransaction.created_at.desc()).limit(limit).offset(offset)
 
     result = await db.execute(query)
     rows = result.all()
 
-    # Map result to include profile name
+    # Map only the fields FinanceRead needs, avoiding SQLAlchemy internal state
+    # (e.g. _sa_instance_state) leaking from the ORM object's __dict__.
     ledger = [
         {
-            **row.FinanceTransaction.__dict__,
-            "profile_name": row.fullname
+            "id": txn.id,
+            "profile_id": txn.profile_id,
+            "profile_name": fullname,
+            "payment_type": txn.payment_type,
+            "amount": txn.amount,
+            "status": txn.status,
+            "payment_method": txn.payment_method,
+            "reference": txn.reference,
+            "paid_at": txn.paid_at,
         }
-        for row in rows
+        for txn, fullname in rows
     ]
 
     return ledger
