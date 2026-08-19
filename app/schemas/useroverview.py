@@ -29,7 +29,6 @@ class GroupWithMembershipRead(BaseModel):
 
 class UserOverview(BaseModel):
     profile: ProfileRead | None
-    group: GroupWithLeaderRead | None
     group: GroupWithMembershipRead | None
 
     model_config = {"from_attributes": True}

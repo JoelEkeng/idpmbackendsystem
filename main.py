@@ -9,7 +9,7 @@ from app.api.v1.router import (
     group,
     user,
     equipment,
-    service, attendance, finance
+    service, attendance, finance, dashboard, visitor
 )
 import dotenv
 dotenv.load_dotenv()
@@ -44,8 +44,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "x-paystack-signature"],
 )
 
 
@@ -63,6 +63,8 @@ app.include_router(equipment.router, prefix=settings.API_PREFIX)
 app.include_router(service.router, prefix=settings.API_PREFIX)
 app.include_router(attendance.router, prefix=settings.API_PREFIX)
 app.include_router(finance.router, prefix=settings.API_PREFIX)
+app.include_router(dashboard.router, prefix=settings.API_PREFIX)
+app.include_router(visitor.router, prefix=settings.API_PREFIX)
 
 @app.get("/health")
 async def health():

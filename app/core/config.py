@@ -25,6 +25,18 @@ class Settings(BaseSettings):
     DATABASE_URL: AnyUrl
     REDIS_URL: str
 
+    # PostgreSQL connection-pool tuning. Defaults are safe for moderate traffic;
+    # raise them for >1k concurrent users or heavy dashboards.
+    DB_POOL_SIZE: int = 20
+    DB_MAX_OVERFLOW: int = 40
+    DB_POOL_RECYCLE: int = 3600
+    DB_POOL_TIMEOUT: int = 30
+    DB_ECHO: bool = False
+
+    # Redis connection pool tuning.
+    REDIS_MAX_CONNECTIONS: int = 100
+    REDIS_HEALTH_CHECK_INTERVAL: int = 30
+
     BETTERAUTH_PUBLIC_KEY: str
     JWT_ALGORITHM: str = "RS256"
 
@@ -41,7 +53,22 @@ class Settings(BaseSettings):
 
     RATE_LIMIT: str = "100/minute"
 
-    @field_validator("CORS_ORIGINS", mode="before")
+    # Only trust the X-Forwarded-For header when we know we're behind a
+    # reverse proxy/load balancer that sets it itself (it's trivially
+    # spoofable otherwise). Off by default.
+    TRUST_PROXY_HEADERS: bool = False
+
+    # Frontend origin used for building redirect/callback URLs (e.g. Paystack callback).
+    FRONTEND_URL: str = "http://localhost:3000"
+
+    # IP allow-list for the fingerprint access-control device hitting
+    # /attendance/checkin. That endpoint can't use normal user sessions since
+    # the device isn't a logged-in browser, so instead we trust it based on
+    # its network source (exact IPs or CIDR ranges, comma-separated, e.g.
+    # "192.168.1.50,10.0.0.0/24"). Empty means no device is allowed.
+    DEVICE_ALLOWED_IPS: Annotated[list[str], NoDecode] = []
+
+    @field_validator("CORS_ORIGINS", "DEVICE_ALLOWED_IPS", mode="before")
     @classmethod
     def _split_cors_origins(cls, v):
         if isinstance(v, str):

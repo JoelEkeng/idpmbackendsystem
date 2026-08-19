@@ -11,6 +11,8 @@ from datetime import datetime
 from sqlalchemy import func
 from sqlalchemy.orm import selectinload
 
+from app.core.config import get_settings
+from app.core.cache import cache_get_json, cache_set_json, cache_delete
 from app.core.database import get_db
 from app.models.finance import (
     FinanceTransaction,
@@ -31,7 +33,8 @@ from app.utils.auth import get_current_user
 from app.utils.permissions import is_admin, has_any_role
 from app.models.user import User
 from app.models.profile import Profile
-from app.models.enums import RoleEnum
+from app.models.group import Group, GroupMember
+from app.models.enums import RoleEnum, GroupMembershipStatus
 
 from dotenv import load_dotenv
 
@@ -39,6 +42,9 @@ load_dotenv()
 
 
 router = APIRouter(prefix="/finance", tags=["Finance"])
+
+_ADMIN_FINANCE_SUMMARY_CACHE_KEY = "finance:admin-summary"
+_ADMIN_FINANCE_SUMMARY_TTL = 60
 
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
@@ -60,10 +66,7 @@ async def initiate_payment(
 
         due = result.scalar_one_or_none()
 
-        if not due:
-            raise HTTPException(400, "No active dues configured")
-
-        amount = due.amount
+        amount = due.amount if due else 50
 
     if payload.payment_type in [PaymentType.tithe, PaymentType.donation] and not amount:
         raise HTTPException(400, "Amount required")
@@ -94,7 +97,7 @@ async def initiate_payment(
                 "email": user.email,
                 "amount": int(amount * 100),
                 "reference": reference,
-                "callback_url": "http://localhost:3000/payment-success",
+                "callback_url": f"{get_settings().FRONTEND_URL}/payment-success",
             },
         )
 
@@ -158,31 +161,29 @@ async def paystack_webhook(
     await db.commit()
 
     await update_finance_stats(transaction.profile_id, db)
+    await cache_delete(_ADMIN_FINANCE_SUMMARY_CACHE_KEY)
 
     return {"status": "success"}
 
 async def update_finance_stats(profile_id, db):
-
+    # SQL-side aggregation instead of loading every transaction row into
+    # Python just to sum() three subsets of it.
     result = await db.execute(
-        select(FinanceTransaction).where(
+        select(
+            FinanceTransaction.payment_type,
+            func.coalesce(func.sum(FinanceTransaction.amount), 0),
+        )
+        .where(
             FinanceTransaction.profile_id == profile_id,
             FinanceTransaction.status == PaymentStatus.success,
         )
+        .group_by(FinanceTransaction.payment_type)
     )
+    totals = dict(result.all())
 
-    transactions = result.scalars().all()
-
-    tithes = sum(
-        t.amount for t in transactions if t.payment_type == PaymentType.tithe
-    )
-
-    dues = sum(
-        t.amount for t in transactions if t.payment_type == PaymentType.dues
-    )
-
-    donations = sum(
-        t.amount for t in transactions if t.payment_type == PaymentType.donation
-    )
+    tithes = totals.get(PaymentType.tithe, 0)
+    dues = totals.get(PaymentType.dues, 0)
+    donations = totals.get(PaymentType.donation, 0)
 
     result = await db.execute(
         select(ProfileFinanceStats).where(
@@ -218,10 +219,26 @@ async def manual_payment(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    # Recording a manual payment marks money as received, so it must be
-    # restricted to the finance team / admins.
-    if not has_any_role(user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN):
-        raise HTTPException(403, "Finance access required")
+    # Recording a manual payment marks money as received, so it's restricted
+    # to the finance team / admins, OR a group leader recording a payment for
+    # one of their own (APPROVED) group members — never for anyone else's.
+    privileged = has_any_role(user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN)
+    if not privileged:
+        target_profile = await db.get(Profile, payload.profile_id)
+        if not target_profile:
+            raise HTTPException(404, "Profile not found")
+
+        membership_q = await db.execute(
+            select(GroupMember).where(
+                GroupMember.user_id == target_profile.user_id,
+                GroupMember.status == GroupMembershipStatus.APPROVED,
+            )
+        )
+        membership = membership_q.scalar_one_or_none()
+        group = await db.get(Group, membership.group_id) if membership else None
+        is_own_group_member = bool(group and group.leader_id == user.id)
+        if not is_own_group_member:
+            raise HTTPException(403, "Finance access required")
 
     reference = str(uuid.uuid4())
     transaction = FinanceTransaction(
@@ -239,6 +256,7 @@ async def manual_payment(
     await db.commit()
 
     await update_finance_stats(payload.profile_id, db)
+    await cache_delete(_ADMIN_FINANCE_SUMMARY_CACHE_KEY)
 
     return {"message": "Payment recorded"}
 
@@ -248,6 +266,7 @@ async def get_ledger(
     status: PaymentStatus | None = Query(None),
     payment_type: PaymentType | None = Query(None),
     user_id: str | None = Query(None),
+    group_id: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -258,9 +277,18 @@ async def get_ledger(
     privileged = has_any_role(
         current_user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN
     )
-    if not privileged:
+
+    if group_id:
+        # Only that group's leader (or a privileged user) may filter by it.
+        group = await db.get(Group, group_id)
+        if not group:
+            raise HTTPException(404, "Group not found")
+        if not privileged and group.leader_id != current_user.id:
+            raise HTTPException(403, "Only that group's leader can view this")
+    elif not privileged:
         # Force scoping to the caller.
         user_id = current_user.id
+
     # Start from FinanceTransaction and join Profile → User
     query = (
         select(FinanceTransaction, Profile.fullname)
@@ -268,6 +296,13 @@ async def get_ledger(
         .join(Profile.user)                # Join User via profile.user_id
     )
 
+    if group_id:
+        query = query.join(
+            GroupMember,
+            (GroupMember.user_id == User.id)
+            & (GroupMember.group_id == group_id)
+            & (GroupMember.status == GroupMembershipStatus.APPROVED),
+        )
     if user_id:
         query = query.where(User.id == user_id)
     if status:
@@ -333,6 +368,10 @@ async def admin_finance_summary(
     if not has_any_role(current_user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN):
         raise HTTPException(403, "Finance access required")
 
+    cached = await cache_get_json(_ADMIN_FINANCE_SUMMARY_CACHE_KEY)
+    if cached is not None:
+        return cached
+
     # Aggregate totals from ProfileFinanceStats
     result = await db.execute(
         select(
@@ -343,35 +382,42 @@ async def admin_finance_summary(
     )
     total_tithes, total_dues, total_donations = result.fetchone()
 
-    # Aggregate counts and total amounts from FinanceTransaction
-    result = await db.execute(
+    # Aggregate counts and total amounts from FinanceTransaction by status
+    # in a single query instead of three sequential round trips.
+    status_result = await db.execute(
         select(
+            FinanceTransaction.status,
             func.count(FinanceTransaction.id),
-            func.coalesce(func.sum(FinanceTransaction.amount), 0)
+            func.coalesce(func.sum(FinanceTransaction.amount), 0),
         )
-        .where(FinanceTransaction.status == PaymentStatus.pending)
+        .where(FinanceTransaction.status.in_(
+            [PaymentStatus.pending, PaymentStatus.success, PaymentStatus.failed]
+        ))
+        .group_by(FinanceTransaction.status)
     )
-    pending_count, pending_total = result.fetchone()
 
-    result = await db.execute(
-        select(
-            func.count(FinanceTransaction.id),
-            func.coalesce(func.sum(FinanceTransaction.amount), 0)
-        )
-        .where(FinanceTransaction.status == PaymentStatus.success)
+    status_metrics = {
+        row[0]: {"count": row[1], "total": row[2]} for row in status_result.all()
+    }
+
+    pending_metrics = status_metrics.get(PaymentStatus.pending, {"count": 0, "total": 0})
+    success_metrics = status_metrics.get(PaymentStatus.success, {"count": 0, "total": 0})
+    failed_metrics = status_metrics.get(PaymentStatus.failed, {"count": 0, "total": 0})
+
+    pending_count, pending_total = (
+        pending_metrics["count"],
+        pending_metrics["total"],
     )
-    success_count, total_paid = result.fetchone()
-
-    result = await db.execute(
-        select(
-            func.count(FinanceTransaction.id),
-            func.coalesce(func.sum(FinanceTransaction.amount), 0)
-        )
-        .where(FinanceTransaction.status == PaymentStatus.failed)
+    success_count, total_paid = (
+        success_metrics["count"],
+        success_metrics["total"],
     )
-    failed_count, failed_total = result.fetchone()
+    failed_count, failed_total = (
+        failed_metrics["count"],
+        failed_metrics["total"],
+    )
 
-    return {
+    payload = {
         "total_tithes": total_tithes,
         "total_dues": total_dues,
         "total_donations": total_donations,
@@ -382,12 +428,15 @@ async def admin_finance_summary(
         "failed_transactions": failed_count,
         "failed_total": failed_total,
     }
+    await cache_set_json(_ADMIN_FINANCE_SUMMARY_CACHE_KEY, payload, ttl=_ADMIN_FINANCE_SUMMARY_TTL)
+    return payload
 
 
 @router.post("/verify")
 async def verify_payment(
     payload: dict,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     reference = payload.get("reference")
     if not reference:
@@ -398,6 +447,14 @@ async def verify_payment(
         select(FinanceTransaction).where(FinanceTransaction.reference == reference)
     )
     transaction = result.scalar_one_or_none()
+
+    # Only the transaction's owner or an admin/finance user may verify/view it.
+    if transaction:
+        owner = current_user.profile and transaction.profile_id == current_user.profile.id
+        if not owner and not has_any_role(
+            current_user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN
+        ):
+            raise HTTPException(403, "Not allowed to verify this transaction")
 
     if transaction and transaction.status == PaymentStatus.success:
         return {"status": "success"}

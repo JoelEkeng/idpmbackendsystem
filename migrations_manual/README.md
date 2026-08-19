@@ -11,6 +11,11 @@ psql "$DATABASE_URL" -f backend/migrations_manual/2026_05_08_roles_array.sql
 
 ## What's here
 
+- **`2026_08_17_leader_approved_membership_status.sql`** — Adds
+  `LEADER_APPROVED` to `membership_status_enum` for the new two-stage group
+  approval workflow (`PENDING -> LEADER_APPROVED -> APPROVED`, or `REJECTED`
+  at either stage).
+
 - **`2026_05_08_roles_array.sql`** — Converts `profiles.role` (single enum)
   into `profiles.roles` (array of `role_enum`). Adds `USER` and `ADMIN` to
   `role_enum`. Backfills existing rows so:

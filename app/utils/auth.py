@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.models.user import User
 from app.models.session import Session as AuthSession
 
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload
 
 async def get_current_user(
     authorization: str | None = Header(default=None),
@@ -23,33 +23,29 @@ async def get_current_user(
 
     session_token = authorization.replace("Bearer ", "", 1)
 
+    # Single round-trip: join the session, user, and profile. `joinedload`
+    # is used for the one-to-one profile relationship so no extra query is
+    # emitted when downstream code accesses user.profile.
     result = await db.execute(
-        select(AuthSession).where(AuthSession.token == session_token)
+        select(User, AuthSession.expiresAt)
+        .join(AuthSession, AuthSession.userId == User.id)
+        .options(joinedload(User.profile))
+        .where(AuthSession.token == session_token)
     )
-    session = result.scalar_one_or_none()
+    row = result.unique().one_or_none()
 
-    if not session:
+    if not row:
         raise HTTPException(status_code=401, detail="Invalid session")
+
+    user, expires_at = row
 
     # Reject expired sessions. `expiresAt` may be stored tz-naive (UTC) or
     # tz-aware depending on the driver; normalize before comparing.
-    expires_at = session.expiresAt
     if expires_at is not None:
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at < datetime.now(timezone.utc):
             raise HTTPException(status_code=401, detail="Session expired")
-
-    result = await db.execute(
-        select(User)
-        .options(selectinload(User.profile))  # loads profile
-        .where(User.id == session.userId)
-    )
-
-    user = result.scalar_one_or_none()
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
 
     return user
 

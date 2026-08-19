@@ -6,15 +6,92 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.database import get_db
+from app.core.cache import cache_get_json, cache_set_json, cache_delete
 from app.models.user import User
 from app.models.group import GroupMember, Group
 from app.schemas.useroverview import UserOverview, GroupWithMembershipRead
 from app.schemas.user import UserAdminOverview, UserMinimal
-from app.models.enums import RoleEnum
+from app.models.enums import RoleEnum, GroupMembershipStatus
 from app.utils.auth import get_current_user
 from app.utils.permissions import is_admin
 
 router = APIRouter(prefix="/users", tags=["Users"])
+
+
+def _user_overview_cache_key(user_id: str) -> str:
+    return f"user:overview:{user_id}"
+
+
+class MemberRead(BaseModel):
+    id: str  # profile id — what /finance/manual expects as profile_id
+    user_id: str
+    full_name: str
+    email: str | None
+    department: str | None
+    group_name: str | None
+    membership_status: GroupMembershipStatus | None
+
+
+@router.get("", response_model=list[MemberRead])
+async def get_users(
+    group_id: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List members, optionally scoped to a group.
+
+    Without `group_id` this is admin-only. With `group_id`, that group's
+    leader may also call it (e.g. to pick a member for a manual payment or
+    to view their group roster) — but only for their own group.
+    """
+    if group_id:
+        group = await db.get(Group, group_id)
+        if not group:
+            raise HTTPException(404, "Group not found")
+        if group.leader_id != current_user.id and not is_admin(current_user):
+            raise HTTPException(403, "Only that group's leader can view this")
+    elif not is_admin(current_user):
+        raise HTTPException(403, "Admins only")
+
+    stmt = (
+        select(User)
+        .options(
+            selectinload(User.profile),
+            selectinload(User.memberships).selectinload(GroupMember.group),
+        )
+        .order_by(User.id)
+        .limit(limit)
+        .offset(offset)
+    )
+    if group_id:
+        stmt = stmt.join(GroupMember, GroupMember.user_id == User.id).where(
+            GroupMember.group_id == group_id,
+            GroupMember.status == GroupMembershipStatus.APPROVED,
+        )
+
+    result = await db.execute(stmt)
+    users = result.scalars().unique().all()
+
+    response = []
+    for user in users:
+        if not user.profile:
+            continue
+        membership = user.memberships[0] if user.memberships else None
+        response.append(
+            MemberRead(
+                id=str(user.profile.id),
+                user_id=user.id,
+                full_name=user.profile.fullname or user.name,
+                email=user.email,
+                department=user.profile.department,
+                group_name=membership.group.name if membership else None,
+                membership_status=membership.status if membership else None,
+            )
+        )
+    return response
+
 
 @router.get("/{user_id}/overview", response_model=UserOverview)
 async def get_user_overview(
@@ -25,6 +102,12 @@ async def get_user_overview(
     # A user may view their own overview; admins may view anyone's.
     if user_id != current_user.id and not is_admin(current_user):
         raise HTTPException(403, "Not allowed to view this user")
+
+    cache_key = _user_overview_cache_key(user_id)
+    cached = await cache_get_json(cache_key)
+    if cached is not None:
+        return cached
+
     stmt = (
         select(User)
         .where(User.id == user_id)
@@ -55,11 +138,9 @@ async def get_user_overview(
     else:
         group_data = None
 
-    return {
-        "profile": user.profile,
-        "group": group_data,
-        
-    }
+    overview = UserOverview(profile=user.profile, group=group_data)
+    await cache_set_json(cache_key, overview.model_dump(mode="json"), ttl=60)
+    return overview
 
 
 
@@ -108,13 +189,20 @@ async def get_user_overview(
 
 @router.get("/minimal", response_model=list[UserMinimal])
 async def get_minimal_users(
+    limit: int = Query(500, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     # Select only the columns we need
-    stmt = select(User.id, User.name, User.email)
+    stmt = (
+        select(User.id, User.name, User.email)
+        .order_by(User.name)
+        .limit(limit)
+        .offset(offset)
+    )
     result = await db.execute(stmt)
-    
+
     # Map to list of UserMinimal
     users = result.all()  # returns list of tuples (id, full_name)
     return [UserMinimal(id=u.id, fullname=u.name, email=u.email) for u in users]
@@ -134,9 +222,6 @@ async def get_minimal_user(
         raise HTTPException(404, "User not found")
 
     return UserMinimal(id=user.id, fullname=user.name)
-    # Map to list of UserMinimal
-    users = result.all()  # returns list of tuples (id, full_name)
-    return [UserMinimal(id=u.id, fullname=u.name) for u in users]
 
 
 

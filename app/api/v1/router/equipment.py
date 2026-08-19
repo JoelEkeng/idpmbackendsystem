@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.database import get_db
+from app.core.cache import cache_get_json, cache_set_json, cache_delete
 from app.models.equipment import Equipment
 from app.models.user import User
 from app.models.enums import RoleEnum
@@ -11,19 +12,31 @@ from app.utils.permissions import is_admin
 
 router = APIRouter(prefix="/equipment", tags=["Equipments"])
 
+_EQUIPMENT_CACHE_KEY = "equipment:all"
+_EQUIPMENT_CACHE_TTL = 300  # equipment changes rarely
+
 
 @router.get("", response_model=list[EquipmentRead])
 async def get_equipments(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     if not is_admin(current_user):
         raise HTTPException(403, "Admins only")
 
-    stmt = select(Equipment)
+    cached = await cache_get_json(_EQUIPMENT_CACHE_KEY)
+    if cached is not None:
+        return cached
+
+    stmt = select(Equipment).limit(limit).offset(offset)
     result = await db.execute(stmt)
     equipments = result.scalars().all()
-    return equipments
+
+    payload = [EquipmentRead.model_validate(e).model_dump(mode="json") for e in equipments]
+    await cache_set_json(_EQUIPMENT_CACHE_KEY, payload, ttl=_EQUIPMENT_CACHE_TTL)
+    return payload
 
 
 @router.post("", response_model=EquipmentRead)
@@ -53,6 +66,7 @@ async def create_equipment(
     await db.commit()
     await db.refresh(equipment)
 
+    await cache_delete(_EQUIPMENT_CACHE_KEY)
     return equipment
 
 
@@ -77,6 +91,7 @@ async def update_equipment(
     await db.commit()
     await db.refresh(equipment)
 
+    await cache_delete(_EQUIPMENT_CACHE_KEY)
     return equipment
 
 
@@ -96,4 +111,5 @@ async def delete_equipment(
     await db.delete(equipment)
     await db.commit()
 
+    await cache_delete(_EQUIPMENT_CACHE_KEY)
     return {"message": "Equipment deleted successfully"}

@@ -6,4 +6,5 @@ from .attendance import Attendance
 from .finance import FinanceTransaction, DueConfig, ProfileFinanceStats
 from .equipment import Equipment
 from .session import Session
+from .visitor import Visitor
 from .base import TimestampMixin, UUIDMixin

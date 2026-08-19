@@ -25,6 +25,9 @@ class Group(str, enum.Enum):
     SIMEON = "SIMEON"
 
 class GroupMembershipStatus(str, enum.Enum):
+    # PENDING -> LEADER_APPROVED (leader recommends) -> APPROVED (admin gives
+    # final approval). REJECTED can happen at either stage.
     PENDING = "PENDING"
+    LEADER_APPROVED = "LEADER_APPROVED"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"

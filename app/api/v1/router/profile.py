@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.database import get_db
+from app.core.cache import cache_delete
 from app.models.profile import Profile
 from app.models.user import User
 from app.schemas.profile import (
@@ -18,6 +19,10 @@ from app.utils.permissions import is_admin, is_super_admin
 from app.models.enums import RoleEnum
 
 router = APIRouter(prefix="/profiles", tags=["Profiles"])
+
+
+def _user_overview_cache_key(user_id: str) -> str:
+    return f"user:overview:{user_id}"
 
 
 # ---------------------------------------------------------
@@ -52,7 +57,12 @@ async def sync_profile(
 async def create_profile( 
     payload: ProfileCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    # Only allow creating your own profile, or an admin creating on behalf of a user.
+    if payload.user_id != current_user.id and not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     # Ensure user exists in BetterAuth user table mirror
     stmt = select(User).where(User.id == payload.user_id)
     result = await db.execute(stmt)
@@ -125,7 +135,12 @@ async def update_fingerprint_id(
 async def get_profile(
     user_id: str,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    # Users may only view their own profile unless they're an admin/leader.
+    if user_id != current_user.id and not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     stmt = select(Profile).where(Profile.user_id == user_id)
     result = await db.execute(stmt)
     profile = result.scalar_one_or_none()
@@ -145,7 +160,12 @@ async def update_profile(
     user_id: str,
     payload: ProfileUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    # Users may only edit their own profile unless they're an admin.
+    if user_id != current_user.id and not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     stmt = select(Profile).where(Profile.user_id == user_id)
     result = await db.execute(stmt)
     profile = result.scalar_one_or_none()
@@ -154,6 +174,11 @@ async def update_profile(
         raise HTTPException(status_code=404, detail="Profile not found")
 
     update_data = payload.model_dump(exclude_unset=True)
+
+    # fingerprint_id is admin-managed only (see /profiles/{user_id}/fingerprint);
+    # strip it here to prevent a member from setting/overwriting it via self-update.
+    if not is_admin(current_user):
+        update_data.pop("fingerprint_id", None)
 
     for field, value in update_data.items():
         setattr(profile, field, value)
@@ -171,6 +196,7 @@ async def update_profile(
 
     await db.commit()
     await db.refresh(profile)
+    await cache_delete(_user_overview_cache_key(user_id))
 
     return profile
 
@@ -218,6 +244,7 @@ async def update_role(
 
     await db.commit()
     await db.refresh(profile)
+    await cache_delete(_user_overview_cache_key(user_id))
 
     return profile
 
