@@ -10,7 +10,8 @@ from sqlalchemy import (
     Numeric,
     Enum,
     Boolean,
-    UniqueConstraint,
+    Index,
+    desc,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, UUIDMixin, TimestampMixin
@@ -57,7 +58,7 @@ class FinanceTransaction(Base, UUIDMixin, TimestampMixin):
     )
 
     reference: Mapped[str] = mapped_column(
-        String, unique=True, index=True
+        String, unique=True
     )
 
     paystack_reference: Mapped[str | None] = mapped_column(String)
@@ -74,7 +75,13 @@ class FinanceTransaction(Base, UUIDMixin, TimestampMixin):
     )
 
     __table_args__ = (
-        UniqueConstraint("reference"),
+        Index("ix_finance_transactions_status", "status"),
+        Index("ix_finance_transactions_payment_type", "payment_type"),
+        Index("ix_finance_transactions_profile_id", "profile_id"),
+        Index("ix_finance_transactions_created_at_desc", desc("created_at")),
+        Index("ix_finance_transactions_status_created_at", "status", desc("created_at")),
+        Index("ix_finance_transactions_profile_status", "profile_id", "status"),
+        Index("ix_finance_transactions_profile_created_at", "profile_id", desc("created_at")),
     )
 
 

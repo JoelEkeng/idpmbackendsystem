@@ -44,7 +44,6 @@ class GroupMember(Base, UUIDMixin, TimestampMixin):
     user_id: Mapped[str] = mapped_column(
         ForeignKey("user.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
 
     group_id: Mapped[str] = mapped_column(

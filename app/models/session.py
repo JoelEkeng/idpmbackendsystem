@@ -1,4 +1,4 @@
-from sqlalchemy import String, DateTime
+from sqlalchemy import String, DateTime, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -14,3 +14,7 @@ class Session(Base):
     )
     token: Mapped[str] = mapped_column(String, index=True)
     expiresAt: Mapped[datetime] = mapped_column(DateTime)
+
+    __table_args__ = (
+        Index("ix_session_expires_at", "expiresAt"),
+    )

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.database import get_db
-from app.core.cache import cache_get_json, cache_set_json, cache_delete
+from app.core.cache import cache_get_json, cache_set_json, cache_delete_prefix
 from app.models.equipment import Equipment
 from app.models.user import User
 from app.models.enums import RoleEnum
@@ -12,8 +12,12 @@ from app.utils.permissions import is_admin
 
 router = APIRouter(prefix="/equipment", tags=["Equipments"])
 
-_EQUIPMENT_CACHE_KEY = "equipment:all"
+_EQUIPMENT_CACHE_PREFIX = "equipment:list:"
 _EQUIPMENT_CACHE_TTL = 300  # equipment changes rarely
+
+
+def _equipment_cache_key(limit: int, offset: int) -> str:
+    return f"{_EQUIPMENT_CACHE_PREFIX}{limit}:{offset}"
 
 
 @router.get("", response_model=list[EquipmentRead])
@@ -26,7 +30,8 @@ async def get_equipments(
     if not is_admin(current_user):
         raise HTTPException(403, "Admins only")
 
-    cached = await cache_get_json(_EQUIPMENT_CACHE_KEY)
+    cache_key = _equipment_cache_key(limit, offset)
+    cached = await cache_get_json(cache_key)
     if cached is not None:
         return cached
 
@@ -35,7 +40,7 @@ async def get_equipments(
     equipments = result.scalars().all()
 
     payload = [EquipmentRead.model_validate(e).model_dump(mode="json") for e in equipments]
-    await cache_set_json(_EQUIPMENT_CACHE_KEY, payload, ttl=_EQUIPMENT_CACHE_TTL)
+    await cache_set_json(cache_key, payload, ttl=_EQUIPMENT_CACHE_TTL)
     return payload
 
 
@@ -66,7 +71,7 @@ async def create_equipment(
     await db.commit()
     await db.refresh(equipment)
 
-    await cache_delete(_EQUIPMENT_CACHE_KEY)
+    await cache_delete_prefix(_EQUIPMENT_CACHE_PREFIX)
     return equipment
 
 
@@ -91,7 +96,7 @@ async def update_equipment(
     await db.commit()
     await db.refresh(equipment)
 
-    await cache_delete(_EQUIPMENT_CACHE_KEY)
+    await cache_delete_prefix(_EQUIPMENT_CACHE_PREFIX)
     return equipment
 
 
@@ -111,5 +116,5 @@ async def delete_equipment(
     await db.delete(equipment)
     await db.commit()
 
-    await cache_delete(_EQUIPMENT_CACHE_KEY)
+    await cache_delete_prefix(_EQUIPMENT_CACHE_PREFIX)
     return {"message": "Equipment deleted successfully"}

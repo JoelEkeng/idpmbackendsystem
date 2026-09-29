@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from uuid import UUID
 from app.core.database import get_db
 from app.core.cache import cache_get_json, cache_set_json, cache_delete
@@ -21,7 +21,38 @@ from app.models.enums import RoleEnum
 router = APIRouter(prefix="/groups", tags=["Group"])
 
 _GROUPS_CACHE_KEY = "groups:all"
+_ADMIN_DASHBOARD_CACHE_KEY = "dashboard:admin-summary"
 _GROUPS_CACHE_TTL = 300  # groups/leaders/member counts change rarely
+
+
+def _user_overview_cache_key(user_id: str) -> str:
+    return f"user:overview:{user_id}"
+
+
+async def _invalidate_group_member_overviews(db: AsyncSession, group_id: UUID) -> None:
+    result = await db.execute(
+        select(GroupMember.user_id).where(GroupMember.group_id == group_id)
+    )
+    await cache_delete(*(_user_overview_cache_key(user_id) for user_id in result.scalars()))
+
+
+async def _transition_membership(
+    db: AsyncSession,
+    membership_id: UUID,
+    expected_statuses: tuple[GroupMembershipStatus, ...],
+    new_status: GroupMembershipStatus,
+    approved_by: str,
+) -> GroupMember | None:
+    result = await db.execute(
+        update(GroupMember)
+        .where(
+            GroupMember.id == membership_id,
+            GroupMember.status.in_(expected_statuses),
+        )
+        .values(status=new_status, approved_by=approved_by)
+        .returning(GroupMember)
+    )
+    return result.scalar_one_or_none()
 
 
 @router.get("", response_model=list[GroupRead])
@@ -92,7 +123,7 @@ async def create_group(
     db.add(group)
     await db.commit()
     await db.refresh(group)
-    await cache_delete(_GROUPS_CACHE_KEY)
+    await cache_delete(_GROUPS_CACHE_KEY, _ADMIN_DASHBOARD_CACHE_KEY)
 
     # Build response object for GroupRead
     response_data = GroupRead.model_validate({
@@ -137,6 +168,7 @@ async def update_group(
     await db.commit()
     await db.refresh(group)
     await cache_delete(_GROUPS_CACHE_KEY)
+    await _invalidate_group_member_overviews(db, group.id)
 
     return group
 
@@ -154,9 +186,10 @@ async def delete_group(
     if not group:
         raise HTTPException(404, "Group not found")
 
+    await _invalidate_group_member_overviews(db, group.id)
     await db.delete(group)
     await db.commit()
-    await cache_delete(_GROUPS_CACHE_KEY)
+    await cache_delete(_GROUPS_CACHE_KEY, _ADMIN_DASHBOARD_CACHE_KEY)
 
     return {"message": "Group deleted successfully"}
 
@@ -199,6 +232,10 @@ async def request_group_membership(
     db.add(membership)
     await db.commit()
     await db.refresh(membership)
+    await cache_delete(
+        _GROUPS_CACHE_KEY,
+        _user_overview_cache_key(current_user.id),
+    )
 
     return membership
 
@@ -247,16 +284,25 @@ async def approve_group_member(
     if membership.user_id == current_user.id:
         raise HTTPException(403, "You cannot approve your own membership request")
 
-    if membership.status != GroupMembershipStatus.PENDING:
+    updated = await _transition_membership(
+        db,
+        membership_id,
+        (GroupMembershipStatus.PENDING,),
+        GroupMembershipStatus.LEADER_APPROVED,
+        current_user.id,
+    )
+    if updated is None:
+        await db.rollback()
         raise HTTPException(400, "Only pending requests can be approved by the leader")
 
-    membership.status = GroupMembershipStatus.LEADER_APPROVED
-    membership.approved_by = current_user.id
-
     await db.commit()
-    await db.refresh(membership)
+    await db.refresh(updated)
+    await cache_delete(
+        _GROUPS_CACHE_KEY,
+        _user_overview_cache_key(updated.user_id),
+    )
 
-    return membership
+    return updated
 
 
 @router.post("/{membership_id}/approve-final", response_model=GroupMemberRead)
@@ -274,23 +320,31 @@ async def admin_approve_group_member(
     if not membership:
         raise HTTPException(404, "Membership not found")
 
-    if membership.status != GroupMembershipStatus.LEADER_APPROVED:
-        raise HTTPException(
-            400, "Only leader-approved requests can receive final admin approval"
-        )
-
     # An admin cannot approve their own membership request.
     if membership.user_id == current_user.id:
         raise HTTPException(403, "You cannot approve your own membership request")
 
-    membership.status = GroupMembershipStatus.APPROVED
-    membership.approved_by = current_user.id
+    updated = await _transition_membership(
+        db,
+        membership_id,
+        (GroupMembershipStatus.LEADER_APPROVED,),
+        GroupMembershipStatus.APPROVED,
+        current_user.id,
+    )
+    if updated is None:
+        await db.rollback()
+        raise HTTPException(
+            400, "Only leader-approved requests can receive final admin approval"
+        )
 
     await db.commit()
-    await db.refresh(membership)
-    await cache_delete(_GROUPS_CACHE_KEY)
+    await db.refresh(updated)
+    await cache_delete(
+        _GROUPS_CACHE_KEY,
+        _user_overview_cache_key(updated.user_id),
+    )
 
-    return membership
+    return updated
 
 
 @router.get("/admin/leader-approved", response_model=list[GroupMemberRead])
@@ -333,22 +387,35 @@ async def reject_group_member(
     if not (admin or is_leader):
         raise HTTPException(403, "Only the group leader or an admin can reject members")
 
-    if is_leader and not admin and membership.status != GroupMembershipStatus.PENDING:
-        raise HTTPException(400, "Leaders can only reject pending requests")
-
-    if membership.status not in (
-        GroupMembershipStatus.PENDING,
-        GroupMembershipStatus.LEADER_APPROVED,
-    ):
+    expected_statuses = (
+        (GroupMembershipStatus.PENDING,)
+        if is_leader and not admin
+        else (
+            GroupMembershipStatus.PENDING,
+            GroupMembershipStatus.LEADER_APPROVED,
+        )
+    )
+    updated = await _transition_membership(
+        db,
+        membership_id,
+        expected_statuses,
+        GroupMembershipStatus.REJECTED,
+        current_user.id,
+    )
+    if updated is None:
+        await db.rollback()
+        if is_leader and not admin:
+            raise HTTPException(400, "Leaders can only reject pending requests")
         raise HTTPException(400, "This request has already been finalized")
 
-    membership.status = GroupMembershipStatus.REJECTED
-    membership.approved_by = current_user.id
-
     await db.commit()
-    await db.refresh(membership)
+    await db.refresh(updated)
+    await cache_delete(
+        _GROUPS_CACHE_KEY,
+        _user_overview_cache_key(updated.user_id),
+    )
 
-    return membership
+    return updated
 
 @router.get("/{group_id}/members", response_model=list[GroupMemberRead])
 async def get_group_members(

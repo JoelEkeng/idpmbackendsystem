@@ -5,8 +5,6 @@ read `.length`, this exposes cheap SQL COUNT()s (and the finance summary
 already computed elsewhere) behind a single Redis-cached endpoint.
 """
 
-import asyncio
-
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,24 +38,24 @@ async def admin_dashboard_summary(
     if cached is not None:
         return cached
 
-    # All counts are independent; run them concurrently.
+    summary = await db.execute(
+        select(
+            select(func.count()).select_from(Profile).scalar_subquery(),
+            select(func.count()).select_from(Group).scalar_subquery(),
+            select(func.count()).select_from(Service).scalar_subquery(),
+            select(func.count()).select_from(Attendance).scalar_subquery(),
+            select(func.coalesce(func.sum(FinanceTransaction.amount), 0))
+            .where(FinanceTransaction.status == PaymentStatus.success)
+            .scalar_subquery(),
+        )
+    )
     (
         total_members,
         total_groups,
         total_services,
         total_attendance,
         total_revenue,
-    ) = await asyncio.gather(
-        db.scalar(select(func.count()).select_from(Profile)),
-        db.scalar(select(func.count()).select_from(Group)),
-        db.scalar(select(func.count()).select_from(Service)),
-        db.scalar(select(func.count()).select_from(Attendance)),
-        db.scalar(
-            select(func.coalesce(func.sum(FinanceTransaction.amount), 0)).where(
-                FinanceTransaction.status == PaymentStatus.success
-            )
-        ),
-    )
+    ) = summary.one()
 
     payload = {
         "total_members": total_members or 0,

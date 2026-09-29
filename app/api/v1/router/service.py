@@ -16,6 +16,7 @@ router = APIRouter(prefix="/services", tags=["Services"])
 
 _SERVICES_CACHE_KEY = "services:all"
 _SERVICES_CACHE_TTL = 60  # seconds; services change rarely
+_ADMIN_DASHBOARD_CACHE_KEY = "dashboard:admin-summary"
 
 
 @router.get("", response_model=list[ServiceRead])
@@ -53,7 +54,7 @@ async def create_service(
     await db.commit()
     await db.refresh(service)
 
-    await cache_delete(_SERVICES_CACHE_KEY)
+    await cache_delete(_SERVICES_CACHE_KEY, _ADMIN_DASHBOARD_CACHE_KEY)
     return service
 
 @router.patch("/{service_id}", response_model=ServiceRead)
@@ -98,5 +99,5 @@ async def delete_service(
     await db.delete(service)
     await db.commit()
 
-    await cache_delete(_SERVICES_CACHE_KEY)
+    await cache_delete(_SERVICES_CACHE_KEY, _ADMIN_DASHBOARD_CACHE_KEY)
     return {"message": "Service deleted successfully"}

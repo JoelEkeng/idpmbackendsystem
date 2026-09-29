@@ -70,7 +70,6 @@ class Profile(Base, UUIDMixin, TimestampMixin):
     profile_completed: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
-        index=True,
     )
 
     user: Mapped["User"] = relationship(

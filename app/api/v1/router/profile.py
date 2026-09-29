@@ -20,6 +20,8 @@ from app.models.enums import RoleEnum
 
 router = APIRouter(prefix="/profiles", tags=["Profiles"])
 
+_ADMIN_DASHBOARD_CACHE_KEY = "dashboard:admin-summary"
+
 
 def _user_overview_cache_key(user_id: str) -> str:
     return f"user:overview:{user_id}"
@@ -50,6 +52,7 @@ async def sync_profile(
     db.add(profile)
     await db.commit()
     await db.refresh(profile)
+    await cache_delete(_ADMIN_DASHBOARD_CACHE_KEY)
     return profile
 
 
@@ -87,6 +90,7 @@ async def create_profile(
     db.add(profile)
     await db.commit()
     await db.refresh(profile)
+    await cache_delete(_ADMIN_DASHBOARD_CACHE_KEY)
 
     return profile
 
@@ -123,6 +127,7 @@ async def update_fingerprint_id(
 
     await db.commit()
     await db.refresh(profile)
+    await cache_delete(_user_overview_cache_key(user_id))
 
     return profile
 
@@ -271,5 +276,9 @@ async def delete_profile(
 
     await db.delete(profile)
     await db.commit()
+    await cache_delete(
+        _ADMIN_DASHBOARD_CACHE_KEY,
+        _user_overview_cache_key(user_id),
+    )
 
     return

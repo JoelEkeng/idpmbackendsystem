@@ -2,9 +2,10 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 
 from app.core.database import get_db
-from app.core.cache import cache_get_json, cache_set_json, cache_delete
+from app.core.cache import cache_get_json, cache_set_json, cache_delete, cache_delete_prefix
 from app.models.attendance import Attendance
 from app.models.profile import Profile
 from app.models.service import Service
@@ -24,8 +25,33 @@ import json
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
 
 
-def _service_cache_key(service_id) -> str:
-    return f"attendance:service:{service_id}"
+def _service_cache_key(service_id, limit: int, offset: int) -> str:
+    return f"attendance:service:{service_id}:{limit}:{offset}"
+
+
+async def _record_attendance(
+    db: AsyncSession,
+    profile_id: UUIDType,
+    service_id: UUIDType,
+    check_in_time: datetime,
+) -> bool:
+    result = await db.execute(
+        insert(Attendance)
+        .values(
+            profile_id=profile_id,
+            service_id=service_id,
+            check_in_time=check_in_time,
+        )
+        .on_conflict_do_nothing(
+            constraint="uq_attendance_profile_service",
+        )
+        .returning(Attendance.id)
+    )
+    if result.scalar_one_or_none() is None:
+        await db.rollback()
+        return False
+    await db.commit()
+    return True
 
 
 @router.post("/checkin")
@@ -92,32 +118,17 @@ async def fingerprint_checkin(
             "message": "No service currently ongoing",
         }
 
-    # 🚫 Prevent duplicate attendance
-    stmt = select(Attendance).where(
-        Attendance.profile_id == profile.id,
-        Attendance.service_id == service.id,
-    )
-    result = await db.execute(stmt)
-    existing = result.scalar_one_or_none()
-
-    if existing:
+    created = await _record_attendance(db, profile.id, service.id, now)
+    if not created:
         return {
             "status": "duplicate",
             "message": "Attendance already recorded",
         }
 
-    # ✅ Save attendance
-    attendance = Attendance(
-        profile_id=profile.id,
-        service_id=service.id,
-        check_in_time=now,
-    )
-    db.add(attendance)
-    await db.commit()
-
     # Invalidate the cached attendance list for this service so the monitor
     # page reflects the new check-in on its next refresh.
-    await cache_delete(_service_cache_key(service.id))
+    await cache_delete_prefix(f"attendance:service:{service.id}:")
+    await cache_delete("dashboard:admin-summary")
 
     return {
         "status": "success",
@@ -173,6 +184,8 @@ async def get_user_attendance(
     user_id: str,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
     """Attendance for a BetterAuth user id (resolves to the linked profile)."""
     profile_q = await db.execute(
@@ -206,6 +219,8 @@ async def get_user_attendance(
         .options(*_ATTENDANCE_EAGER)
         .where(Attendance.profile_id == profile.id)
         .order_by(Attendance.check_in_time.desc())
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(stmt)
     return [_to_read(a) for a in result.scalars().all()]
@@ -215,6 +230,8 @@ async def get_user_attendance(
 async def get_my_attendance(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
     """Current user's own attendance history."""
     profile_q = await db.execute(
@@ -229,6 +246,8 @@ async def get_my_attendance(
         .options(*_ATTENDANCE_EAGER)
         .where(Attendance.profile_id == profile.id)
         .order_by(Attendance.check_in_time.desc())
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(stmt)
     return [_to_read(a) for a in result.scalars().all()]
@@ -239,6 +258,8 @@ async def get_profile_attendance(
     profile_id: UUIDType,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
     """
     Attendance for a specific profile.
@@ -275,6 +296,8 @@ async def get_profile_attendance(
         .options(*_ATTENDANCE_EAGER)
         .where(Attendance.profile_id == profile_id)
         .order_by(Attendance.check_in_time.desc())
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(stmt)
     return [_to_read(a) for a in result.scalars().all()]
@@ -285,6 +308,8 @@ async def get_group_attendance(
     group_id: UUIDType,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
     """
     Attendance for all APPROVED members of a group.
@@ -316,6 +341,8 @@ async def get_group_attendance(
         .options(*_ATTENDANCE_EAGER)
         .where(Attendance.profile_id.in_(profile_ids))
         .order_by(Attendance.check_in_time.desc())
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(stmt)
     return [_to_read(a) for a in result.scalars().all()]
@@ -326,6 +353,8 @@ async def get_service_attendance(
     service_id: UUIDType,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
     """Attendance for every member who attended a specific service.
 
@@ -334,7 +363,7 @@ async def get_service_attendance(
     if not is_admin(current_user):
         raise HTTPException(403, "Admins only")
 
-    cache_key = _service_cache_key(service_id)
+    cache_key = _service_cache_key(service_id, limit, offset)
     cached = await cache_get_json(cache_key)
     if cached is not None:
         return cached
@@ -344,6 +373,8 @@ async def get_service_attendance(
         .options(*_ATTENDANCE_EAGER)
         .where(Attendance.service_id == service_id)
         .order_by(Attendance.check_in_time.desc())
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(stmt)
     records = [_to_read(a) for a in result.scalars().all()]

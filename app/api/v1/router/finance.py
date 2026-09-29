@@ -1,15 +1,18 @@
 import uuid
 import httpx
-import os
 import hmac
 import hashlib
+import csv
+import io
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime
 from sqlalchemy import func
 from sqlalchemy.orm import selectinload
+from sqlalchemy.dialects.postgresql import insert
 
 from app.core.config import get_settings
 from app.core.cache import cache_get_json, cache_set_json, cache_delete
@@ -36,18 +39,16 @@ from app.models.profile import Profile
 from app.models.group import Group, GroupMember
 from app.models.enums import RoleEnum, GroupMembershipStatus
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 
 router = APIRouter(prefix="/finance", tags=["Finance"])
 
 _ADMIN_FINANCE_SUMMARY_CACHE_KEY = "finance:admin-summary"
+_ADMIN_DASHBOARD_CACHE_KEY = "dashboard:admin-summary"
 _ADMIN_FINANCE_SUMMARY_TTL = 60
 
-PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY")
-PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
+settings = get_settings()
+PAYSTACK_SECRET = settings.PAYSTACK_SECRET_KEY
+PAYSTACK_INIT_URL = f"{settings.PAYSTACK_BASE_URL.rstrip('/')}/transaction/initialize"
 
 @router.post("/initiate")
 async def initiate_payment(
@@ -55,6 +56,8 @@ async def initiate_payment(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if not PAYSTACK_SECRET:
+        raise HTTPException(503, "Payment provider not configured")
 
     amount = payload.amount
 
@@ -85,7 +88,7 @@ async def initiate_payment(
     db.add(transaction)
     await db.commit()
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=settings.PAYSTACK_TIMEOUT_SECONDS) as client:
 
         response = await client.post(
             PAYSTACK_INIT_URL,
@@ -158,16 +161,30 @@ async def paystack_webhook(
     transaction.status = PaymentStatus.success
     transaction.paid_at = datetime.utcnow()
 
-    await db.commit()
+    try:
+        await update_finance_stats(transaction.profile_id, db)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
-    await update_finance_stats(transaction.profile_id, db)
-    await cache_delete(_ADMIN_FINANCE_SUMMARY_CACHE_KEY)
+    await cache_delete(
+        _ADMIN_FINANCE_SUMMARY_CACHE_KEY,
+        _ADMIN_DASHBOARD_CACHE_KEY,
+    )
 
     return {"status": "success"}
 
 async def update_finance_stats(profile_id, db):
-    # SQL-side aggregation instead of loading every transaction row into
-    # Python just to sum() three subsets of it.
+    await db.flush()
+    profile = await db.scalar(
+        select(Profile.id)
+        .where(Profile.id == profile_id)
+        .with_for_update()
+    )
+    if profile is None:
+        raise HTTPException(404, "Profile not found")
+
     result = await db.execute(
         select(
             FinanceTransaction.payment_type,
@@ -181,36 +198,24 @@ async def update_finance_stats(profile_id, db):
     )
     totals = dict(result.all())
 
-    tithes = totals.get(PaymentType.tithe, 0)
-    dues = totals.get(PaymentType.dues, 0)
-    donations = totals.get(PaymentType.donation, 0)
-
-    result = await db.execute(
-        select(ProfileFinanceStats).where(
-            ProfileFinanceStats.profile_id == profile_id
+    values = {
+        "profile_id": profile_id,
+        "total_tithes": totals.get(PaymentType.tithe, 0),
+        "total_dues": totals.get(PaymentType.dues, 0),
+        "total_donations": totals.get(PaymentType.donation, 0),
+    }
+    await db.execute(
+        insert(ProfileFinanceStats)
+        .values(**values)
+        .on_conflict_do_update(
+            index_elements=[ProfileFinanceStats.profile_id],
+            set_={
+                "total_tithes": values["total_tithes"],
+                "total_dues": values["total_dues"],
+                "total_donations": values["total_donations"],
+            },
         )
     )
-
-    stats = result.scalar_one_or_none()
-
-    if not stats:
-
-        stats = ProfileFinanceStats(
-            profile_id=profile_id,
-            total_tithes=tithes,
-            total_dues=dues,
-            total_donations=donations,
-        )
-
-        db.add(stats)
-
-    else:
-
-        stats.total_tithes = tithes
-        stats.total_dues = dues
-        stats.total_donations = donations
-
-    await db.commit()
 
 
 @router.post("/manual")
@@ -223,11 +228,11 @@ async def manual_payment(
     # to the finance team / admins, OR a group leader recording a payment for
     # one of their own (APPROVED) group members — never for anyone else's.
     privileged = has_any_role(user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN)
-    if not privileged:
-        target_profile = await db.get(Profile, payload.profile_id)
-        if not target_profile:
-            raise HTTPException(404, "Profile not found")
+    target_profile = await db.get(Profile, payload.profile_id)
+    if not target_profile:
+        raise HTTPException(404, "Profile not found")
 
+    if not privileged:
         membership_q = await db.execute(
             select(GroupMember).where(
                 GroupMember.user_id == target_profile.user_id,
@@ -253,27 +258,31 @@ async def manual_payment(
     )
 
     db.add(transaction)
-    await db.commit()
+    try:
+        await update_finance_stats(payload.profile_id, db)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
-    await update_finance_stats(payload.profile_id, db)
-    await cache_delete(_ADMIN_FINANCE_SUMMARY_CACHE_KEY)
+    await cache_delete(
+        _ADMIN_FINANCE_SUMMARY_CACHE_KEY,
+        _ADMIN_DASHBOARD_CACHE_KEY,
+    )
 
     return {"message": "Payment recorded"}
 
 
-@router.get("/ledger", response_model=list[FinanceRead])
-async def get_ledger(
-    status: PaymentStatus | None = Query(None),
-    payment_type: PaymentType | None = Query(None),
-    user_id: str | None = Query(None),
-    group_id: str | None = Query(None),
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    # Finance team, admins, and super admins can read the full ledger.
-    # Regular users can only read their own rows.
+async def _resolve_ledger_scope(
+    db: AsyncSession,
+    current_user: User,
+    user_id: str | None,
+    group_id: str | None,
+) -> str | None:
+    """Shared access-control for the ledger: finance/admin/super-admin see
+    everything, a group's leader sees their group, everyone else is forced to
+    their own rows. Returns the (possibly overridden) `user_id` filter.
+    """
     privileged = has_any_role(
         current_user, RoleEnum.FINANCE, RoleEnum.ADMIN, RoleEnum.SUPER_ADMIN
     )
@@ -289,6 +298,15 @@ async def get_ledger(
         # Force scoping to the caller.
         user_id = current_user.id
 
+    return user_id
+
+
+def _build_ledger_query(
+    status: PaymentStatus | None,
+    payment_type: PaymentType | None,
+    user_id: str | None,
+    group_id: str | None,
+):
     # Start from FinanceTransaction and join Profile → User
     query = (
         select(FinanceTransaction, Profile.fullname)
@@ -310,14 +328,13 @@ async def get_ledger(
     if payment_type:
         query = query.where(FinanceTransaction.payment_type == payment_type)
 
-    query = query.order_by(FinanceTransaction.created_at.desc()).limit(limit).offset(offset)
+    return query.order_by(FinanceTransaction.created_at.desc())
 
-    result = await db.execute(query)
-    rows = result.all()
 
+def _rows_to_ledger(rows) -> list[dict]:
     # Map only the fields FinanceRead needs, avoiding SQLAlchemy internal state
     # (e.g. _sa_instance_state) leaking from the ORM object's __dict__.
-    ledger = [
+    return [
         {
             "id": txn.id,
             "profile_id": txn.profile_id,
@@ -332,7 +349,79 @@ async def get_ledger(
         for txn, fullname in rows
     ]
 
-    return ledger
+
+@router.get("/ledger", response_model=list[FinanceRead])
+async def get_ledger(
+    status: PaymentStatus | None = Query(None),
+    payment_type: PaymentType | None = Query(None),
+    user_id: str | None = Query(None),
+    group_id: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # Finance team, admins, and super admins can read the full ledger.
+    # Regular users can only read their own rows.
+    user_id = await _resolve_ledger_scope(db, current_user, user_id, group_id)
+
+    query = _build_ledger_query(status, payment_type, user_id, group_id).limit(limit).offset(offset)
+
+    result = await db.execute(query)
+    return _rows_to_ledger(result.all())
+
+
+# Hard ceiling on exported rows so a single request can't be used to pull an
+# unbounded amount of data out of the database in one shot.
+_EXPORT_MAX_ROWS = 20_000
+
+
+@router.get("/export")
+async def export_ledger_csv(
+    status: PaymentStatus | None = Query(None),
+    payment_type: PaymentType | None = Query(None),
+    user_id: str | None = Query(None),
+    group_id: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Export the finance ledger (respecting the same scoping/filters as
+    `/finance/ledger`) as a CSV download. Covers the finance dashboard,
+    transactions list, ledger, and a member's own payment history — anywhere
+    that already reads from the ledger can reuse this with the same filters.
+    """
+    user_id = await _resolve_ledger_scope(db, current_user, user_id, group_id)
+
+    query = _build_ledger_query(status, payment_type, user_id, group_id).limit(_EXPORT_MAX_ROWS)
+
+    result = await db.execute(query)
+    ledger = _rows_to_ledger(result.all())
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        ["Date", "Member", "Category", "Amount", "Method", "Status", "Reference"]
+    )
+    for row in ledger:
+        writer.writerow(
+            [
+                row["paid_at"].strftime("%Y-%m-%d %H:%M") if row["paid_at"] else "",
+                row["profile_name"],
+                row["payment_type"].value if hasattr(row["payment_type"], "value") else row["payment_type"],
+                f"{row['amount']:.2f}",
+                row["payment_method"],
+                row["status"].value if hasattr(row["status"], "value") else row["status"],
+                row["reference"],
+            ]
+        )
+    buffer.seek(0)
+
+    filename = f"finance-export-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 @router.get("/summary", response_model=FinanceSummary)
 async def finance_summary(
@@ -460,8 +549,8 @@ async def verify_payment(
         return {"status": "success"}
 
     # Verify with Paystack API
-    VERIFY_URL = f"https://api.paystack.co/transaction/verify/{reference}"
-    async with httpx.AsyncClient() as client:
+    VERIFY_URL = f"{settings.PAYSTACK_BASE_URL.rstrip('/')}/transaction/verify/{reference}"
+    async with httpx.AsyncClient(timeout=settings.PAYSTACK_TIMEOUT_SECONDS) as client:
         resp = await client.get(
             VERIFY_URL,
             headers={"Authorization": f"Bearer {PAYSTACK_SECRET}"}
@@ -475,7 +564,15 @@ async def verify_payment(
     if transaction:
         transaction.status = PaymentStatus.success
         transaction.paid_at = datetime.utcnow()
-        await db.commit()
-        await update_finance_stats(transaction.profile_id, db)
+        try:
+            await update_finance_stats(transaction.profile_id, db)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        await cache_delete(
+            _ADMIN_FINANCE_SUMMARY_CACHE_KEY,
+            _ADMIN_DASHBOARD_CACHE_KEY,
+        )
 
     return {"status": "success"}

@@ -1,5 +1,5 @@
 from sqlalchemy.orm import relationship, Mapped, mapped_column
-from sqlalchemy import Date, Time, Integer, String
+from sqlalchemy import Date, Time, Integer, String, Index
 from app.models.base import Base, UUIDMixin, TimestampMixin
 from typing import List
 from datetime import date, time
@@ -21,4 +21,8 @@ class Service(Base, UUIDMixin, TimestampMixin):
     attendances: Mapped[List["Attendance"]] = relationship(
         back_populates="service",
         cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_services_date_desc", date.desc()),
     )

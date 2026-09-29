@@ -37,11 +37,6 @@ class Settings(BaseSettings):
     REDIS_MAX_CONNECTIONS: int = 100
     REDIS_HEALTH_CHECK_INTERVAL: int = 30
 
-    BETTERAUTH_PUBLIC_KEY: str
-    JWT_ALGORITHM: str = "RS256"
-
-    # Allowed browser origins for CORS. Accepts a comma-separated string or a
-    # JSON list in the environment, e.g. "https://app.example.com,https://admin.example.com".
     CORS_ORIGINS: Annotated[list[str], NoDecode] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
@@ -50,8 +45,20 @@ class Settings(BaseSettings):
     SENTRY_DSN: str | None = None
     SENTRY_ENVIRONMENT: str = "development"
     SENTRY_TRACES_SAMPLE_RATE: float = 0.0
+    SENTRY_SEND_DEFAULT_PII: bool = False
+    SENTRY_ENABLE_LOGS: bool = True
+
+    REQUEST_METRICS_ENABLED: bool = True
+    READINESS_TIMEOUT_SECONDS: float = 10.0
 
     RATE_LIMIT: str = "100/minute"
+    FINANCE_RATE_LIMIT: str = "20/minute"
+    ATTENDANCE_CHECKIN_RATE_LIMIT: str = "60/minute"
+    VISITOR_RATE_LIMIT: str = "20/minute"
+
+    PAYSTACK_SECRET_KEY: str | None = None
+    PAYSTACK_BASE_URL: str = "https://api.paystack.co"
+    PAYSTACK_TIMEOUT_SECONDS: float = 10.0
 
     # Only trust the X-Forwarded-For header when we know we're behind a
     # reverse proxy/load balancer that sets it itself (it's trivially

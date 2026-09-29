@@ -43,11 +43,9 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_finance_transactions_status_created_a
 CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_finance_transactions_profile_status
     ON finance_transactions (profile_id, status);
 
--- ----------------------------------------------------------------------------
--- Profile finance stats (looked up on every profile overview / summary call)
--- ----------------------------------------------------------------------------
-CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_profile_finance_stats_profile_id
-    ON profile_finance_stats (profile_id);
+-- Composite covering profile-scoped ledger ordering.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_finance_transactions_profile_created_at
+    ON finance_transactions (profile_id, created_at DESC);
 
 -- ----------------------------------------------------------------------------
 -- Services (filtered by date for check-in and listing)
@@ -59,7 +57,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_services_date_desc
 -- Sessions (expiry checks run on every auth verification)
 -- ----------------------------------------------------------------------------
 CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_session_expires_at
-    ON session (expiresAt);
+    ON session ("expiresAt");
 
 -- ----------------------------------------------------------------------------
 -- Groups (leader lookups, list ordering)
@@ -75,4 +73,14 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_group_members_status
 
 -- Already created in initial migration, but kept here for completeness.
 -- CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_group_members_group_id ON group_members (group_id);
--- CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_group_members_user_id ON group_members (user_id);
+
+-- ----------------------------------------------------------------------------
+-- Remove indexes made redundant by equivalent unique/composite indexes.
+-- Keep the constraint-backed indexes and the composite indexes used by queries.
+-- ----------------------------------------------------------------------------
+DROP INDEX CONCURRENTLY IF EXISTS ix_finance_transactions_reference;
+DROP INDEX CONCURRENTLY IF EXISTS ix_profile_finance_stats_profile_id;
+DROP INDEX CONCURRENTLY IF EXISTS ix_profiles_profile_completed;
+DROP INDEX CONCURRENTLY IF EXISTS ix_group_members_user_id;
+DROP INDEX CONCURRENTLY IF EXISTS ix_attendances_service_id;
+DROP INDEX CONCURRENTLY IF EXISTS ix_attendances_profile_id;

@@ -9,6 +9,7 @@ than blocking all traffic.
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from fastapi import Request
@@ -16,6 +17,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import get_settings
+from app.core.database import engine
 from app.core.redis import redis_client
 from app.utils.network import get_client_ip
 
@@ -49,26 +51,65 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class RequestMetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        started = time.perf_counter()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", request.url.path)
+            pool = engine.pool
+            checked_out = getattr(pool, "checkedout", lambda: None)()
+            overflow = getattr(pool, "overflow", lambda: None)()
+            logger.info(
+                "request method=%s route=%s status=%s duration_ms=%.2f pid=%s db_checked_out=%s db_overflow=%s",
+                request.method,
+                route_path,
+                status_code,
+                (time.perf_counter() - started) * 1000,
+                os.getpid(),
+                checked_out,
+                overflow,
+            )
+
+
+_RATE_LIMIT_SCRIPT = """
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return current
+"""
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Fixed-window rate limiter backed by Redis, keyed by client IP."""
 
     # Sensitive prefixes get a tighter limit than the global default,
     # regardless of what RATE_LIMIT is set to.
-    STRICT_PREFIXES: dict[str, str] = {
+    DEFAULT_STRICT_PREFIXES: dict[str, str] = {
         "/api/v1/finance": "20/minute",
         "/api/v1/attendance/checkin": "60/minute",
-        # Includes both public registration (POST) and admin listing (GET),
-        # since the limiter is path- not method-based. Tighter than the
-        # default since registration has no login gating it.
         "/api/v1/visitors": "20/minute",
     }
 
-    def __init__(self, app, rate: str = "100/minute", exempt_paths: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        app,
+        rate: str = "100/minute",
+        exempt_paths: tuple[str, ...] = (),
+        strict_rates: dict[str, str] | None = None,
+    ):
         super().__init__(app)
         self.limit, self.window = _parse_rate(rate)
         self.exempt_paths = exempt_paths
         self.strict_limits = {
-            prefix: _parse_rate(r) for prefix, r in self.STRICT_PREFIXES.items()
+            prefix: _parse_rate(value)
+            for prefix, value in (strict_rates or self.DEFAULT_STRICT_PREFIXES).items()
         }
 
     def _limit_for(self, path: str) -> tuple[str, int, int]:
@@ -88,9 +129,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         key = f"ratelimit:{bucket}:{ip}:{window_id}"
 
         try:
-            current = await redis_client.incr(key)
-            if current == 1:
-                await redis_client.expire(key, window)
+            current = await redis_client.eval(_RATE_LIMIT_SCRIPT, 1, key, window)
         except Exception as exc:  # pragma: no cover - network dependent
             logger.warning("Rate limiter unavailable, allowing request: %s", exc)
             return await call_next(request)

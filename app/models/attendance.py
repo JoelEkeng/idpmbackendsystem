@@ -12,13 +12,11 @@ class Attendance(Base, UUIDMixin, TimestampMixin):
     service_id: Mapped[UUID] = mapped_column(
         ForeignKey("services.id"),
         nullable=False,
-        index=True,
     )
 
     profile_id: Mapped[UUID] = mapped_column(
         ForeignKey("profiles.id"),
         nullable=False,
-        index=True,
     )
 
     check_in_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
